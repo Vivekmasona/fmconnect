@@ -1,105 +1,142 @@
-// server.js — FM Room Signaling with auto 2-listener groups
-import express from "express";
-import { WebSocketServer } from "ws";
-import http from "http";
-import crypto from "crypto";
+// server.js — BiharFM signaling + auto 2-listener rooms
+// Node.js: npm i express ws
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
 const app = express();
+app.get("/", (_, res) => res.send("🎧 BiharFM auto-room signaling"));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-app.get("/", (req, res) => res.send("🎧 Bihar FM Room Server is running"));
+// clientId -> { ws, role, customId, roomId }
+const clients = new Map();
+// roomId -> Set(clientId)
+const rooms = new Map();
 
-// --- Data Structures ---
-let broadcaster = null;
-let listeners = new Map(); // id -> ws
-let rooms = []; // [{ id: "fm1234", members: [listenerIds] }]
-
-// --- Utility ---
-function createRoomId() {
-  return "fm" + Math.floor(1000 + Math.random() * 90000);
+function genRoomId() {
+  const n = Math.floor(1000 + Math.random() * 90000);
+  return `fm${n}`;
 }
-function getOrCreateRoom() {
-  let room = rooms.find(r => r.members.length < 2);
-  if (!room) {
-    room = { id: createRoomId(), members: [] };
-    rooms.push(room);
+function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  try { ws.send(JSON.stringify(obj)); } catch (e) {}
+}
+function findRoomWithOne() {
+  for (const [rid, set] of rooms.entries()) {
+    if (set.size === 1) return rid;
   }
-  return room;
+  return null;
 }
-function broadcastTo(ws, data) {
-  if (ws?.readyState === ws.OPEN) ws.send(JSON.stringify(data));
+function addToRoom(clientId, roomId) {
+  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+  rooms.get(roomId).add(clientId);
+  const c = clients.get(clientId);
+  if (c) c.roomId = roomId;
+}
+function removeFromRoom(clientId) {
+  const c = clients.get(clientId);
+  if (!c || !c.roomId) return;
+  const r = c.roomId;
+  const set = rooms.get(r);
+  if (set) {
+    set.delete(clientId);
+    if (set.size === 0) rooms.delete(r);
+  }
+  delete c.roomId;
 }
 
-// --- WebSocket Connections ---
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  ws.id = id;
+  clients.set(id, { ws, role: null, customId: id, roomId: null });
+  console.log("→ connected:", id);
 
-  ws.on("message", async (msg) => {
-    try {
-      const data = JSON.parse(msg);
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    const { type, role, customId, target, payload } = msg;
+    const entry = clients.get(id);
 
-      // --- Register broadcaster ---
-      if (data.type === "register" && data.role === "broadcaster") {
-        broadcaster = ws;
-        broadcastTo(ws, { type: "registered", role: "broadcaster" });
-        console.log("🎙️ Broadcaster connected:", id);
-      }
+    if (type === "register") {
+      entry.role = role || "listener";
+      if (customId) entry.customId = customId;
 
-      // --- Register listener ---
-      else if (data.type === "register" && data.role === "listener") {
-        listeners.set(id, ws);
-        const room = getOrCreateRoom();
-        room.members.push(id);
-        ws.roomId = room.id;
-        broadcastTo(ws, { type: "room-joined", roomId: room.id });
-        console.log(`👂 Listener joined room ${room.id} (${room.members.length}/2)`);
+      if (entry.role === "listener") {
+        // assign to room with 1 member or create new
+        let roomId = findRoomWithOne();
+        if (!roomId) roomId = genRoomId();
+        addToRoom(id, roomId);
+        safeSend(ws, { type: "room-assigned", roomId });
+        console.log(`listener ${entry.customId} -> ${roomId} (${rooms.get(roomId).size}/2)`);
 
-        // Notify broadcaster about new listener
-        if (broadcaster)
-          broadcastTo(broadcaster, { type: "listener-joined", id });
-      }
-
-      // --- Relay signaling ---
-      else if (data.type === "offer" && data.target) {
-        const target = listeners.get(data.target);
-        if (target) broadcastTo(target, { type: "offer", from: id, payload: data.payload });
-      } else if (data.type === "answer" && broadcaster) {
-        broadcastTo(broadcaster, { type: "answer", from: id, payload: data.payload });
-      } else if (data.type === "candidate") {
-        if (data.target && broadcaster && data.role === "broadcaster") {
-          const target = listeners.get(data.target);
-          if (target) broadcastTo(target, { type: "candidate", from: id, payload: data.payload });
-        } else if (broadcaster && data.role === "listener") {
-          broadcastTo(broadcaster, { type: "candidate", from: id, payload: data.payload });
+        // notify broadcaster(s) about join so broadcaster can make peer/offer
+        for (const [, c] of clients) {
+          if (c.role === "broadcaster") safeSend(c.ws, { type: "listener-joined", id, roomId });
         }
       }
 
-      // --- Metadata broadcast ---
-      else if (data.type === "metadata") {
-        // Send metadata to all listeners
-        for (const l of listeners.values())
-          broadcastTo(l, { type: "metadata", payload: data.payload });
+      if (entry.role === "broadcaster") {
+        console.log("▶ broadcaster registered");
+        // optionally send current rooms state
+        const list = Array.from(rooms.entries()).map(([r,s])=>({ roomId: r, count: s.size }));
+        safeSend(ws, { type: "rooms-info", rooms: list });
       }
-    } catch (e) {
-      console.warn("WS parse error:", e);
+      return;
+    }
+
+    // signaling relay (offer/answer/candidate)
+    if (["offer","answer","candidate"].includes(type) && target) {
+      const t = clients.get(target);
+      if (t) safeSend(t.ws, { type, from: id, payload });
+      return;
+    }
+
+    // metadata from broadcaster -> forward to listeners
+    if (type === "metadata" && clients.get(id)?.role === "broadcaster") {
+      for (const [cid, c] of clients.entries()) {
+        if (c.role === "listener") safeSend(c.ws, { type: "metadata", ...payload });
+      }
+      return;
+    }
+
+    // optional: room-message (forward to peers in same room)
+    if (type === "room-message") {
+      const c = clients.get(id);
+      if (!c || !c.roomId) return;
+      const set = rooms.get(c.roomId) || new Set();
+      for (const cid of set) {
+        if (cid === id) continue;
+        const peer = clients.get(cid);
+        if (peer) safeSend(peer.ws, { type: "room-message", from: id, payload });
+      }
+      return;
     }
   });
 
   ws.on("close", () => {
-    if (broadcaster === ws) {
-      broadcaster = null;
-      console.log("❌ Broadcaster disconnected");
-    } else {
-      listeners.delete(id);
-      rooms.forEach(r => (r.members = r.members.filter(m => m !== id)));
-      rooms = rooms.filter(r => r.members.length > 0);
-      if (broadcaster)
-        broadcastTo(broadcaster, { type: "peer-left", id });
+    console.log("← disconnected:", id);
+    const entry = clients.get(id);
+    const roomId = entry?.roomId;
+    removeFromRoom(id);
+    clients.delete(id);
+    // notify broadcasters about peer-left
+    for (const [, c] of clients) {
+      if (c.role === "broadcaster") safeSend(c.ws, { type: "peer-left", id, roomId });
+    }
+    if (roomId) console.log(`room ${roomId} now ${(rooms.get(roomId)?.size || 0)}`);
+  });
+
+  ws.on("error", () => {
+    const entry = clients.get(id);
+    const roomId = entry?.roomId;
+    removeFromRoom(id);
+    clients.delete(id);
+    for (const [, c] of clients) {
+      if (c.role === "broadcaster") safeSend(c.ws, { type: "peer-left", id, roomId });
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("✅ Server running on port", PORT));
+server.listen(PORT, () => console.log(`Signaling server listening on ${PORT}`));
