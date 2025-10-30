@@ -11,7 +11,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Configuration
-const MAX_PER_ROOM = 4;
+const MAX_PER_ROOM = 1;
 
 // clientId -> { ws, role, customId, roomId }
 const clients = new Map();
