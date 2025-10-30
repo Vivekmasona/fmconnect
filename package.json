@@ -1,14 +1,14 @@
 {
-  "name": "biharfm-tree-server",
+  "name": "fm-websocket-server",
   "version": "1.0.0",
-  "description": "BiharFM Tree WebRTC Signaling Server",
+  "description": "FM WebRTC Signaling Server for live audio sync.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.21.1",
+    "express": "^4.19.2",
     "ws": "^8.18.0"
   },
   "engines": {
