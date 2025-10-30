@@ -1,4 +1,4 @@
-// server.js — BiharFM signaling with auto re-parent + rebalance
+// server.js — Cascade relay with auto-heal + forwarding hints
 // npm i express ws
 const express = require("express");
 const http = require("http");
@@ -9,16 +9,16 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// CONFIG — tune these for your deployment
-const MAX_CHILDREN_PER_NODE = 2;   // desired children per relay node
-const ROOT_CHILD_LIMIT = 2;        // how many direct children broadcaster should have
-const HEARTBEAT_TIMEOUT = 15_000;  // ms — if no heartbeat from client, consider dead
-const REBALANCE_INTERVAL = 8_000;  // ms — run rebalance every n ms
+/* CONFIG */
+const MAX_CHILDREN_PER_NODE = 2;   // each node's max children
+const ROOT_CHILD_LIMIT = 2;        // broadcaster direct children
+const HEARTBEAT_TIMEOUT = 15000;   // ms
+const REBALANCE_INTERVAL = 8000;   // ms
 
-// clients: id -> { ws, role, parentId, children:Set, nodeLabel, lastSeen }
-const clients = new Map();
+const clients = new Map(); // id -> { ws, role, parentId, children:Set, nodeLabel, lastSeen }
 
-app.get("/", (_, res) => res.send("🎧 BiharFM signaling (auto-reparent)"));
+/* HTTP debug endpoint */
+app.get("/", (_, res) => res.send("🎧 BiharFM cascade-relay (auto-heal)"));
 app.get("/admin/rooms", (_, res) => {
   const out = [];
   for (const [id, c] of clients.entries()) {
@@ -40,14 +40,13 @@ function genLabel() {
 }
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== ws.OPEN) return;
-  try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
+  try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
 function findRootBroadcaster() {
   for (const [id, c] of clients.entries()) if (c.role === "broadcaster") return id;
   return null;
 }
-
-// BFS to find first node with capacity < limit, optionally excluding a set of node ids
+// BFS find parent with capacity; excludeSet optional
 function findParentNode(exclude = new Set()) {
   const rootId = findRootBroadcaster();
   if (!rootId) return null;
@@ -64,7 +63,6 @@ function findParentNode(exclude = new Set()) {
   return null;
 }
 
-// choose backup parent (used earlier, kept for compatibility)
 function chooseBackupParent(parentId) {
   if (!parentId) return findRootBroadcaster();
   const parent = clients.get(parentId);
@@ -73,7 +71,65 @@ function chooseBackupParent(parentId) {
   return findRootBroadcaster();
 }
 
-// MAIN: handle new connection
+function assignParentFor(childId) {
+  const child = clients.get(childId);
+  if (!child) return;
+  const parentId = findParentNode(new Set());
+  if (!parentId) {
+    child.parentId = null;
+    safeSend(child.ws, { type: "room-assigned", nodeLabel: child.nodeLabel, parentId: null });
+    console.log(`listener ${child.nodeLabel} assigned temporary (no root)`);
+    return;
+  }
+  child.parentId = parentId;
+  clients.get(parentId).children.add(childId);
+  child.backupParent = chooseBackupParent(parentId);
+  safeSend(child.ws, { type: "room-assigned", nodeLabel: child.nodeLabel, parentId });
+  safeSend(clients.get(parentId).ws, { type: "listener-joined", id: childId, childNodeLabel: child.nodeLabel });
+  console.log(`listener ${child.nodeLabel} -> parent ${clients.get(parentId).nodeLabel} (backup ${child.backupParent ? clients.get(child.backupParent)?.nodeLabel : 'none'})`);
+}
+
+function heartbeatSweep() {
+  const now = Date.now();
+  for (const [id, c] of clients.entries()) {
+    if (!c.lastSeen) c.lastSeen = now;
+    if ((now - c.lastSeen) > HEARTBEAT_TIMEOUT) {
+      console.log(`heartbeat timeout for ${id} ${c.nodeLabel} - terminating`);
+      try { c.ws.terminate(); } catch (e) {}
+    }
+  }
+}
+
+function rebalance() {
+  // gather candidate parents sorted by load asc
+  const cand = [];
+  for (const [id, c] of clients.entries()) {
+    if (!c.role) continue;
+    const limit = (c.role === "broadcaster") ? ROOT_CHILD_LIMIT : MAX_CHILDREN_PER_NODE;
+    cand.push({ id, load: c.children.size, limit });
+  }
+  cand.sort((a,b) => a.load - b.load);
+
+  for (const [id, c] of clients.entries()) {
+    const limit = (c.role === "broadcaster") ? ROOT_CHILD_LIMIT : MAX_CHILDREN_PER_NODE;
+    if ((c.children.size || 0) <= limit) continue;
+    const overflow = Array.from(c.children).slice(limit);
+    for (const childId of overflow) {
+      const dest = cand.find(x => x.id !== id && x.load < x.limit);
+      if (!dest) break;
+      c.children.delete(childId);
+      const child = clients.get(childId);
+      if (!child) continue;
+      child.parentId = dest.id;
+      clients.get(dest.id).children.add(childId);
+      dest.load++;
+      safeSend(clients.get(dest.id).ws, { type: "listener-joined", id: childId, childNodeLabel: child.nodeLabel });
+      safeSend(child.ws, { type: "reassigned", newParent: dest.id });
+      console.log(`rebalanced child ${child.nodeLabel} -> ${clients.get(dest.id).nodeLabel}`);
+    }
+  }
+}
+
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   const nodeLabel = genLabel();
@@ -87,36 +143,27 @@ wss.on("connection", (ws) => {
     const entry = clients.get(id);
     if (!entry) return;
 
-    // heartbeat from client
     if (type === "heartbeat") { entry.lastSeen = Date.now(); return; }
 
-    // register
     if (type === "register") {
       entry.role = role || "listener";
       if (customId) entry.customId = customId;
-
       if (entry.role === "broadcaster") {
         console.log("▶ broadcaster registered:", id, entry.nodeLabel);
         safeSend(ws, { type: "registered-as-broadcaster", id, nodeLabel: entry.nodeLabel });
-        // attempt to attach any rootless nodes
-        for (const [cid, c] of clients.entries()) {
-          if (c.role === "listener" && !c.parentId) assignParentFor(cid);
-        }
+        for (const [cid, c] of clients.entries()) if (c.role === "listener" && !c.parentId) assignParentFor(cid);
       } else {
-        // listener: assign parent via BFS
         assignParentFor(id);
       }
       return;
     }
 
-    // signaling messages -> forward to target
     if (["offer","answer","candidate"].includes(type) && target) {
       const t = clients.get(target);
       if (t) safeSend(t.ws, { type, from: id, payload });
       return;
     }
 
-    // broadcaster commands/metadata -> broadcast to all clients (control channel)
     if (type === "cmd" && entry.role === "broadcaster") {
       for (const [cid, c] of clients.entries()) safeSend(c.ws, { type: "cmd", cmd: payload });
       return;
@@ -126,7 +173,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // room-message -> forward to children
     if (type === "room-message") {
       const e = clients.get(id);
       if (!e) return;
@@ -142,7 +188,6 @@ wss.on("connection", (ws) => {
     const c = clients.get(id);
     if (!c) return;
     console.log("← close:", id, c.nodeLabel);
-    // remove from parent's children set
     if (c.parentId) {
       const parent = clients.get(c.parentId);
       if (parent) {
@@ -150,114 +195,31 @@ wss.on("connection", (ws) => {
         safeSend(parent.ws, { type: "child-left", id, nodeLabel: c.nodeLabel });
       }
     }
-    // Reassign each child of the leaving node
     const children = Array.from(c.children);
     for (const ch of children) {
-      // detach child
       const child = clients.get(ch);
       if (!child) continue;
       child.parentId = null;
-      // find new parent; exclude the leaving node and the child itself to avoid cycles
-      const exclude = new Set([id, ch]);
+      const exclude = new Set([id,ch]);
       const newParent = findParentNode(exclude);
       if (newParent) {
         child.parentId = newParent;
         clients.get(newParent).children.add(ch);
-        // notify new parent to create offer
         safeSend(clients.get(newParent).ws, { type: "listener-joined", id: ch, childNodeLabel: child.nodeLabel });
-        // tell child it's been reassigned and who new parent is
         safeSend(child.ws, { type: "reassigned", newParent });
-        // update child's backup parent if needed
         child.backupParent = chooseBackupParent(newParent);
-        console.log(`reassigned child ${child.nodeLabel} -> new parent ${clients.get(newParent).nodeLabel}`);
+        console.log(`reassigned child ${child.nodeLabel} -> ${clients.get(newParent).nodeLabel}`);
       } else {
-        // no parent found (no broadcaster online or full), inform child to wait
         safeSend(child.ws, { type: "reassigned", newParent: null });
-        console.log(`child ${child.nodeLabel} remains rootless (waiting for root)`);
+        console.log(`child ${child.nodeLabel} remains rootless`);
       }
     }
-
     clients.delete(id);
   });
 
-  ws.on("error", (err) => {
-    console.warn("ws error for", id, err);
-  });
+  ws.on("error", (err) => console.warn("ws error for", id, err));
 });
 
-// assignParentFor: helper to assign parent to a node (used on register or rebalancing)
-function assignParentFor(childId) {
-  const child = clients.get(childId);
-  if (!child) return;
-  // find parent
-  const parentId = findParentNode(new Set());
-  if (!parentId) {
-    child.parentId = null;
-    safeSend(child.ws, { type: "room-assigned", nodeLabel: child.nodeLabel, parentId: null });
-    console.log(`listener ${child.nodeLabel} assigned temporary (no root yet)`);
-    return;
-  }
-  child.parentId = parentId;
-  clients.get(parentId).children.add(childId);
-  child.backupParent = chooseBackupParent(parentId);
-  safeSend(child.ws, { type: "room-assigned", nodeLabel: child.nodeLabel, parentId });
-  safeSend(clients.get(parentId).ws, { type: "listener-joined", id: childId, childNodeLabel: child.nodeLabel });
-  console.log(`listener ${child.nodeLabel} -> parent ${clients.get(parentId).nodeLabel} (backup ${child.backupParent ? clients.get(child.backupParent)?.nodeLabel : 'none'})`);
-}
-
-// REBALANCING: move children from overloaded nodes to less loaded ones
-function rebalance() {
-  // build array of candidate parents sorted by load asc
-  const candidates = [];
-  for (const [id, c] of clients.entries()) {
-    // only nodes that can be parents (broadcaster or listener)
-    if (!c.role) continue;
-    const limit = (c.role === "broadcaster") ? ROOT_CHILD_LIMIT : MAX_CHILDREN_PER_NODE;
-    candidates.push({ id, load: c.children.size, limit });
-  }
-  // sort by load ascending (prefer less loaded)
-  candidates.sort((a, b) => a.load - b.load);
-
-  // try to move children from heavy nodes (>limit) to light nodes (<limit)
-  for (const [id, c] of clients.entries()) {
-    const limit = (c.role === "broadcaster") ? ROOT_CHILD_LIMIT : MAX_CHILDREN_PER_NODE;
-    if ((c.children.size || 0) <= limit) continue; // ok
-    const overflow = Array.from(c.children).slice(limit); // children to move
-    for (const childId of overflow) {
-      // find a candidate with room excluding current node and child itself
-      const dest = candidates.find(x => x.id !== id && x.load < x.limit);
-      if (!dest) break;
-      // perform move
-      c.children.delete(childId);
-      const child = clients.get(childId);
-      if (!child) continue;
-      // remove from old parent and add to dest parent
-      child.parentId = dest.id;
-      clients.get(dest.id).children.add(childId);
-      // update loads in candidates array
-      dest.load++;
-      // notify dest parent to create offer and child to expect new parent
-      safeSend(clients.get(dest.id).ws, { type: "listener-joined", id: childId, childNodeLabel: child.nodeLabel });
-      safeSend(child.ws, { type: "reassigned", newParent: dest.id });
-      console.log(`rebalanced child ${child.nodeLabel} -> ${clients.get(dest.id).nodeLabel}`);
-    }
-  }
-}
-
-// heartbeat sweep: kill nodes that didn't heartbeat in time
-function heartbeatSweep() {
-  const now = Date.now();
-  for (const [id, c] of clients.entries()) {
-    if (!c.lastSeen) c.lastSeen = now;
-    if ((now - c.lastSeen) > HEARTBEAT_TIMEOUT) {
-      console.log(`heartbeat timeout for ${id} ${c.nodeLabel} — terminating ws`);
-      try { c.ws.terminate(); } catch (e) {}
-      // connection close handler will reassign children
-    }
-  }
-}
-
-// start periodic tasks
 setInterval(heartbeatSweep, 5000);
 setInterval(rebalance, REBALANCE_INTERVAL);
 
