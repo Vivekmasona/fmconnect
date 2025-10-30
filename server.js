@@ -1,4 +1,4 @@
-// server.js — BiharFM cascade-relay signaling (Node.js)
+// server.js — BiharFM cascade-relay with backup + heartbeat + auto-reassign
 // npm i express ws
 const express = require("express");
 const http = require("http");
@@ -6,16 +6,23 @@ const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const app = express();
-app.get("/", (_, res) => res.send("🎧 BiharFM cascade-relay signaling"));
+app.get("/", (_, res) => res.send("🎧 BiharFM cascade-relay signaling (auto-heal)"));
+app.get("/admin/rooms", (_, res) => {
+  const out = [];
+  for (const [id, c] of clients.entries()) {
+    out.push({ id, nodeLabel: c.nodeLabel, role: c.role, parentId: c.parentId, children: Array.from(c.children || []), lastSeen: c.lastSeen });
+  }
+  res.json(out);
+});
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // CONFIG
-const MAX_CHILDREN_PER_NODE = 2;   // each node forwards to at most 2 children
-const ROOT_CHILD_LIMIT = 2;        // broadcaster direct children (small)
+const MAX_CHILDREN_PER_NODE = 2;
+const ROOT_CHILD_LIMIT = 2;
+const HEARTBEAT_TIMEOUT = 15_000; // if no heartbeat for 15s, consider dead
 
-// clients: id -> { ws, role, parentId, children:Set, nodeLabel }
-const clients = new Map();
+const clients = new Map(); // id -> { ws, role, parentId, children:Set, nodeLabel, lastSeen, backupParent }
 
 function genLabel() {
   const n = Math.floor(1000 + Math.random() * 90000);
@@ -26,14 +33,11 @@ function safeSend(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
 
-// find broadcaster root id (first broadcaster)
 function findRootBroadcaster() {
   for (const [id, c] of clients.entries()) if (c.role === "broadcaster") return id;
   return null;
 }
-
-// BFS to find first node with children < limit
-function findParentNodeForNew() {
+function bfsFindParent(limitForBroadcaster = ROOT_CHILD_LIMIT) {
   const rootId = findRootBroadcaster();
   if (!rootId) return null;
   const q = [rootId];
@@ -48,10 +52,54 @@ function findParentNodeForNew() {
   return null;
 }
 
+// choose a backup parent: prefer parent's parent, else root broadcaster
+function chooseBackupParent(parentId) {
+  if (!parentId) return findRootBroadcaster();
+  const parent = clients.get(parentId);
+  if (!parent) return findRootBroadcaster();
+  if (parent.parentId) return parent.parentId;
+  return findRootBroadcaster();
+}
+
+function reassignChild(childId) {
+  const child = clients.get(childId);
+  if (!child) return;
+  // find new parent
+  const newParent = bfsFindParent();
+  child.parentId = null;
+  if (!newParent) {
+    safeSend(child.ws, { type: "reassigned", newParent: null });
+    console.log(`child ${child.nodeLabel} remains rootless (no broadcaster)`);
+    return;
+  }
+  child.parentId = newParent;
+  clients.get(newParent).children.add(childId);
+  // tell new parent to create offer to this child
+  safeSend(clients.get(newParent).ws, { type: "listener-joined", id: childId, childNodeLabel: child.nodeLabel });
+  // tell child it has a parent now (child just waits for offer; but we inform)
+  safeSend(child.ws, { type: "reassigned", newParent });
+  // assign backup parent
+  child.backupParent = chooseBackupParent(newParent);
+  console.log(`reassigned child ${child.nodeLabel} -> parent ${clients.get(newParent).nodeLabel}`);
+}
+
+function heartbeatSweep() {
+  const now = Date.now();
+  for (const [id, c] of clients.entries()) {
+    if ((now - (c.lastSeen || 0)) > HEARTBEAT_TIMEOUT) {
+      console.log(`heartbeat timeout: ${id} ${c.nodeLabel}`);
+      try { c.ws.terminate(); } catch (e) {}
+      // close handler will handle cleanup
+    }
+  }
+}
+
+setInterval(heartbeatSweep, 5000);
+
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   const nodeLabel = genLabel();
-  clients.set(id, { ws, role: null, parentId: null, children: new Set(), nodeLabel });
+  clients.set(id, { ws, role: null, parentId: null, children: new Set(), nodeLabel, lastSeen: Date.now(), backupParent: null });
   console.log("→ conn:", id, nodeLabel);
 
   ws.on("message", (raw) => {
@@ -60,7 +108,13 @@ wss.on("connection", (ws) => {
     const { type, role, customId, target, payload } = msg;
     const entry = clients.get(id);
 
-    // register
+    // heartbeat (keeps node alive)
+    if (type === "heartbeat") {
+      entry.lastSeen = Date.now();
+      return;
+    }
+
+    // register as broadcaster/listener
     if (type === "register") {
       entry.role = role || "listener";
       if (customId) entry.customId = customId;
@@ -68,65 +122,50 @@ wss.on("connection", (ws) => {
       if (entry.role === "broadcaster") {
         console.log("▶ broadcaster registered:", id, entry.nodeLabel);
         safeSend(ws, { type: "registered-as-broadcaster", id, nodeLabel: entry.nodeLabel });
-        // notify existing listeners: try to reassign any rootless children to this root
+        // try to attach any rootless nodes under broadcaster
         for (const [cid, c] of clients.entries()) {
           if (c.role === "listener" && !c.parentId) {
-            // attempt to place them under root if room
-            const parent = findParentNodeForNew();
-            if (parent) {
-              c.parentId = parent;
-              clients.get(parent).children.add(cid);
-              safeSend(c.ws, { type: "room-assigned", nodeLabel: c.nodeLabel, parentId: parent });
-              safeSend(clients.get(parent).ws, { type: "listener-joined", id: cid, childNodeLabel: c.nodeLabel });
-              console.log(`reassigned existing ${cid} -> parent ${parent}`);
-            }
+            reassignChild(cid);
           }
         }
       } else {
-        // listener: assign parent via BFS
-        const parentId = findParentNodeForNew();
+        // listener registration: assign parent via BFS
+        const parentId = bfsFindParent();
         if (!parentId) {
           entry.parentId = null;
+          entry.backupParent = null;
           safeSend(ws, { type: "room-assigned", nodeLabel: entry.nodeLabel, parentId: null });
           console.log(`listener ${entry.nodeLabel} assigned temporary (no root yet)`);
         } else {
           entry.parentId = parentId;
-          const parent = clients.get(parentId);
-          parent.children.add(id);
+          clients.get(parentId).children.add(id);
+          entry.backupParent = chooseBackupParent(parentId);
           safeSend(ws, { type: "room-assigned", nodeLabel: entry.nodeLabel, parentId });
-          // notify parent to create an offer for this new child
-          safeSend(parent.ws, { type: "listener-joined", id, childNodeLabel: entry.nodeLabel });
-          console.log(`listener ${entry.nodeLabel} -> parent ${parent.nodeLabel}`);
+          safeSend(clients.get(parentId).ws, { type: "listener-joined", id, childNodeLabel: entry.nodeLabel });
+          console.log(`listener ${entry.nodeLabel} -> parent ${clients.get(parentId).nodeLabel} (backup ${entry.backupParent ? clients.get(entry.backupParent)?.nodeLabel : 'none'})`);
         }
       }
       return;
     }
 
-    // signaling messages forwarded by target id
+    // signaling: offer/answer/candidate forwarded to target id
     if (["offer","answer","candidate"].includes(type) && target) {
       const t = clients.get(target);
       if (t) safeSend(t.ws, { type, from: id, payload });
       return;
     }
 
-    // broadcaster commands/metadata: forward to everyone as control messages
-    if (type === "cmd" && clients.get(id)?.role === "broadcaster") {
-      // broadcast command to all clients (listeners + relays)
-      for (const [cid, c] of clients.entries()) {
-        safeSend(c.ws, { type: "cmd", cmd: payload });
-      }
+    // broadcaster commands/metadata forwarded to all clients
+    if (type === "cmd" && entry.role === "broadcaster") {
+      for (const [cid, c] of clients.entries()) safeSend(c.ws, { type: "cmd", cmd: payload });
+      return;
+    }
+    if (type === "metadata" && entry.role === "broadcaster") {
+      for (const [cid, c] of clients.entries()) safeSend(c.ws, { type: "metadata", ...payload });
       return;
     }
 
-    // metadata from broadcaster -> forward to everyone (so UI updates)
-    if (type === "metadata" && clients.get(id)?.role === "broadcaster") {
-      for (const [cid, c] of clients.entries()) {
-        safeSend(c.ws, { type: "metadata", ...payload });
-      }
-      return;
-    }
-
-    // optional: room-message forwarded to children
+    // room-message forwarding to children
     if (type === "room-message") {
       const e = clients.get(id);
       if (!e) return;
@@ -142,28 +181,30 @@ wss.on("connection", (ws) => {
     const c = clients.get(id);
     if (!c) return;
     console.log("← close:", id, c.nodeLabel);
-    // detach from parent
+    // remove from parent children
     if (c.parentId) {
       const parent = clients.get(c.parentId);
       if (parent) parent.children.delete(id);
       if (parent) safeSend(parent.ws, { type: "child-left", id, nodeLabel: c.nodeLabel });
     }
-    // try to reassign children: set parentId null, then try to re-place each child
+    // attempt to reassign each child under best available parent
     for (const ch of Array.from(c.children)) {
+      // detach
       const child = clients.get(ch);
       if (!child) continue;
       child.parentId = null;
-      // find a new parent
-      const newParent = findParentNodeForNew();
+      // find new parent
+      const newParent = bfsFindParent();
       if (newParent) {
         child.parentId = newParent;
         clients.get(newParent).children.add(ch);
-        safeSend(child.ws, { type: "reassigned", newParent });
         safeSend(clients.get(newParent).ws, { type: "listener-joined", id: ch, childNodeLabel: child.nodeLabel });
-        console.log(`reassigned child ${child.nodeLabel} -> newParent ${clients.get(newParent).nodeLabel}`);
+        safeSend(child.ws, { type: "reassigned", newParent });
+        child.backupParent = chooseBackupParent(newParent);
+        console.log(`reassigned child ${child.nodeLabel} -> ${clients.get(newParent).nodeLabel}`);
       } else {
         safeSend(child.ws, { type: "reassigned", newParent: null });
-        console.log(`child ${child.nodeLabel} left rootless (waiting)`);
+        console.log(`child ${child.nodeLabel} remains rootless (waiting)`);
       }
     }
     clients.delete(id);
