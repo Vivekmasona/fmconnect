@@ -1,4 +1,4 @@
-// server.js — BiharFM signaling + auto 2-listener rooms
+// server.js — BiharFM signaling + auto 4-listener rooms
 // Node.js: npm i express ws
 const express = require("express");
 const http = require("http");
@@ -6,9 +6,12 @@ const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const app = express();
-app.get("/", (_, res) => res.send("🎧 BiharFM auto-room signaling"));
+app.get("/", (_, res) => res.send("🎧 BiharFM auto-room signaling (4 listeners per room)"));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+
+// Configuration
+const MAX_PER_ROOM = 4;
 
 // clientId -> { ws, role, customId, roomId }
 const clients = new Map();
@@ -19,22 +22,26 @@ function genRoomId() {
   const n = Math.floor(1000 + Math.random() * 90000);
   return `fm${n}`;
 }
+
 function safeSend(ws, obj) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   try { ws.send(JSON.stringify(obj)); } catch (e) {}
 }
-function findRoomWithOne() {
+
+function findRoomWithSpace() {
   for (const [rid, set] of rooms.entries()) {
-    if (set.size === 1) return rid;
+    if (set.size < MAX_PER_ROOM) return rid;
   }
   return null;
 }
+
 function addToRoom(clientId, roomId) {
   if (!rooms.has(roomId)) rooms.set(roomId, new Set());
   rooms.get(roomId).add(clientId);
   const c = clients.get(clientId);
   if (c) c.roomId = roomId;
 }
+
 function removeFromRoom(clientId) {
   const c = clients.get(clientId);
   if (!c || !c.roomId) return;
@@ -58,41 +65,44 @@ wss.on("connection", (ws) => {
     const { type, role, customId, target, payload } = msg;
     const entry = clients.get(id);
 
+    // --- Registration ---
     if (type === "register") {
       entry.role = role || "listener";
       if (customId) entry.customId = customId;
 
+      // --- Listener logic ---
       if (entry.role === "listener") {
-        // assign to room with 1 member or create new
-        let roomId = findRoomWithOne();
+        let roomId = findRoomWithSpace();
         if (!roomId) roomId = genRoomId();
         addToRoom(id, roomId);
         safeSend(ws, { type: "room-assigned", roomId });
-        console.log(`listener ${entry.customId} -> ${roomId} (${rooms.get(roomId).size}/2)`);
+        console.log(`listener ${entry.customId} -> ${roomId} (${rooms.get(roomId).size}/${MAX_PER_ROOM})`);
 
-        // notify broadcaster(s) about join so broadcaster can make peer/offer
+        // Notify broadcaster(s)
         for (const [, c] of clients) {
-          if (c.role === "broadcaster") safeSend(c.ws, { type: "listener-joined", id, roomId });
+          if (c.role === "broadcaster") {
+            safeSend(c.ws, { type: "listener-joined", id, roomId });
+          }
         }
       }
 
+      // --- Broadcaster logic ---
       if (entry.role === "broadcaster") {
         console.log("▶ broadcaster registered");
-        // optionally send current rooms state
-        const list = Array.from(rooms.entries()).map(([r,s])=>({ roomId: r, count: s.size }));
+        const list = Array.from(rooms.entries()).map(([r, s]) => ({ roomId: r, count: s.size }));
         safeSend(ws, { type: "rooms-info", rooms: list });
       }
       return;
     }
 
-    // signaling relay (offer/answer/candidate)
-    if (["offer","answer","candidate"].includes(type) && target) {
+    // --- WebRTC signaling relay ---
+    if (["offer", "answer", "candidate"].includes(type) && target) {
       const t = clients.get(target);
       if (t) safeSend(t.ws, { type, from: id, payload });
       return;
     }
 
-    // metadata from broadcaster -> forward to listeners
+    // --- Metadata broadcast ---
     if (type === "metadata" && clients.get(id)?.role === "broadcaster") {
       for (const [cid, c] of clients.entries()) {
         if (c.role === "listener") safeSend(c.ws, { type: "metadata", ...payload });
@@ -100,7 +110,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // optional: room-message (forward to peers in same room)
+    // --- Room message broadcast ---
     if (type === "room-message") {
       const c = clients.get(id);
       if (!c || !c.roomId) return;
@@ -114,17 +124,17 @@ wss.on("connection", (ws) => {
     }
   });
 
+  // --- On disconnect ---
   ws.on("close", () => {
     console.log("← disconnected:", id);
     const entry = clients.get(id);
     const roomId = entry?.roomId;
     removeFromRoom(id);
     clients.delete(id);
-    // notify broadcasters about peer-left
     for (const [, c] of clients) {
       if (c.role === "broadcaster") safeSend(c.ws, { type: "peer-left", id, roomId });
     }
-    if (roomId) console.log(`room ${roomId} now ${(rooms.get(roomId)?.size || 0)}`);
+    if (roomId) console.log(`room ${roomId} now ${(rooms.get(roomId)?.size || 0)}/${MAX_PER_ROOM}`);
   });
 
   ws.on("error", () => {
@@ -139,4 +149,4 @@ wss.on("connection", (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Signaling server listening on ${PORT}`));
+server.listen(PORT, () => console.log(`🎧 BiharFM signaling server running on port ${PORT} (max ${MAX_PER_ROOM}/room)`));
