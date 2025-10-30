@@ -1,17 +1,13 @@
 {
-  "name": "fm-websocket-server",
+  "name": "biharfm-server",
   "version": "1.0.0",
-  "description": "FM WebRTC Signaling Server for live audio sync.",
   "main": "server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.18.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "ws": "^8.17.0"
   }
 }
