@@ -1,113 +1,173 @@
-// server.js — Bihar FM WebRTC Signaling + Metadata Relay
+// server.js — Bihar FM Signaling + Pairing (mini-host every N listeners)
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
 const app = express();
+app.get("/", (req, res) => res.send("🎧 Bihar FM Signaling (paired relays)"));
 
-// Root route check
-app.get("/", (req, res) => {
-  res.send("🎧 Bihar FM WebRTC Signaling Server is Live and Ready!");
-});
-
-// HTTP + WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Connected clients
-const clients = new Map(); // id -> { ws, role }
+// config: capacity = number of listeners per mini-host (2 or 3)
+const RELAY_CAPACITY = parseInt(process.env.CAPACITY || "2", 10);
 
-// Safe send helper
-function safeSend(ws, data) {
-  if (ws.readyState === ws.OPEN) {
-    try {
-      ws.send(JSON.stringify(data));
-    } catch (e) {
-      console.error("Send error:", e.message);
-    }
+// data stores
+const clients = new Map();      // id -> { ws, role, pairId }
+const waitingQueue = [];        // list of listener ids waiting to be grouped
+const pairs = new Map();        // pairId -> { members: [ids], miniHostId }
+
+// safe json send
+function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  try { ws.send(JSON.stringify(obj)); } catch (e) { console.warn("send fail", e.message); }
+}
+
+// ping to keep alive
+setInterval(() => {
+  for (const [, c] of clients) safeSend(c.ws, { type: "ping" });
+}, 25000);
+
+// try form a pair when enough listeners waiting
+function tryFormPair() {
+  while (waitingQueue.length >= RELAY_CAPACITY) {
+    const group = waitingQueue.splice(0, RELAY_CAPACITY);
+    const pairId = "vivek" + Math.floor(Math.random() * 900000 + 1000);
+    // choose miniHost randomly from group
+    const miniHostIndex = Math.floor(Math.random() * group.length);
+    const miniHostId = group[miniHostIndex];
+
+    pairs.set(pairId, { members: group.slice(), miniHostId });
+
+    // set pairId for members
+    group.forEach(id => {
+      const c = clients.get(id);
+      if (c) c.pairId = pairId;
+    });
+
+    // notify members
+    group.forEach(id => {
+      const c = clients.get(id);
+      if (!c) return;
+      const role = id === miniHostId ? "mini-host" : "listener";
+      safeSend(c.ws, {
+        type: "pair-created",
+        pairId,
+        members: group,
+        miniHostId,
+        role
+      });
+    });
+
+    console.log(`🔗 Pair created ${pairId} members:`, group, "miniHost:", miniHostId);
   }
 }
 
-// Keep Render / Railway connections alive
-setInterval(() => {
-  for (const [, c] of clients)
-    if (c.ws.readyState === c.ws.OPEN)
-      safeSend(c.ws, { type: "ping" });
-}, 25000);
-
-// WebSocket handling
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  clients.set(id, { ws, role: null });
-  console.log("🔗 Connected:", id);
+  clients.set(id, { ws, role: null, pairId: null });
+  console.log("➕ connected", id);
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    const { type, role, target, payload } = msg;
+    const { type, role, target, payload, pairId } = msg;
 
-    // Register as broadcaster or listener
+    // register
     if (type === "register") {
       clients.get(id).role = role;
       console.log(`🧩 ${id} registered as ${role}`);
 
-      // Notify broadcaster when listener joins
+      // for listeners, push to queue and try pairing
       if (role === "listener") {
-        for (const [, c] of clients)
-          if (c.role === "broadcaster")
-            safeSend(c.ws, { type: "listener-joined", id });
+        if (!waitingQueue.includes(id)) {
+          waitingQueue.push(id);
+          tryFormPair();
+        }
+        // also notify any broadcaster(s) about new listener (optional)
+        for (const [, c] of clients) if (c.role === "broadcaster")
+          safeSend(c.ws, { type: "listener-joined", id });
       }
       return;
     }
 
-    // Relay signaling messages
+    // simple routing of offer/answer/candidate by target id
     if (["offer", "answer", "candidate"].includes(type) && target) {
-      const t = clients.get(target);
-      if (t) safeSend(t.ws, { type, from: id, payload });
+      const tgt = clients.get(target);
+      if (tgt) {
+        safeSend(tgt.ws, { type, from: id, payload, pairId: msg.pairId || null });
+      }
       return;
     }
 
-    // 🔴 Relay metadata to all listeners
+    // relay metadata to all listeners & mini-hosts
     if (type === "metadata") {
-      console.log(`🎵 Metadata update: ${payload?.title || "Unknown title"}`);
-      for (const [, c] of clients)
-        if (c.role === "listener")
-          safeSend(c.ws, {
-            type: "metadata",
-            title: payload.title,
-            artist: payload.artist,
-            cover: payload.cover,
-          });
+      for (const [, c] of clients) {
+        if (c.role === "listener" || c.role === "mini-host") {
+          safeSend(c.ws, { type: "metadata", ...payload });
+        }
+      }
+      return;
+    }
+
+    // master sync: broadcast to everyone (mini-hosts and listeners)
+    if (type === "sync") {
+      for (const [, c] of clients) {
+        // don't echo back to sender
+        if (c.ws === ws) continue;
+        safeSend(c.ws, { type: "sync", payload });
+      }
+      return;
+    }
+
+    // pair-level messages (optional: forwarded to all members of a pair)
+    if (type === "pair-msg" && pairId) {
+      const p = pairs.get(pairId);
+      if (p) {
+        p.members.forEach(mid => {
+          const m = clients.get(mid);
+          if (m) safeSend(m.ws, { type: "pair-msg", from: id, payload });
+        });
+      }
       return;
     }
   });
 
   ws.on("close", () => {
-    const role = clients.get(id)?.role;
+    const info = clients.get(id) || {};
+    const role = info.role;
+    const pairId = info.pairId;
     clients.delete(id);
-    console.log(`❌ ${role || "client"} disconnected: ${id}`);
+    console.log("❌ disconnected", id, role);
 
-    // Notify broadcaster when listener leaves
+    // remove from waiting queue if present
+    const qidx = waitingQueue.indexOf(id);
+    if (qidx !== -1) waitingQueue.splice(qidx, 1);
+
+    // if part of a pair, notify remaining members and cleanup pair
+    if (pairId && pairs.has(pairId)) {
+      const p = pairs.get(pairId);
+      // notify others in pair that this member left
+      p.members.forEach(mid => {
+        if (mid === id) return;
+        const c = clients.get(mid);
+        if (c) safeSend(c.ws, { type: "peer-left", id });
+      });
+      pairs.delete(pairId);
+    }
+
+    // notify broadcaster(s)
     if (role === "listener") {
-      for (const [, c] of clients)
-        if (c.role === "broadcaster")
-          safeSend(c.ws, { type: "peer-left", id });
+      for (const [, c] of clients) if (c.role === "broadcaster")
+        safeSend(c.ws, { type: "peer-left", id });
     }
   });
 
-  ws.on("error", (err) => console.error("WebSocket error:", err.message));
+  ws.on("error", (err) => console.error("WS err", err?.message));
 });
 
-// Keep-alive and headers timeout
-server.keepAliveTimeout = 70000;
-server.headersTimeout = 75000;
-
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Bihar FM Server running on port ${PORT}`));
+server.listen(process.env.PORT || 3000, () => {
+  console.log("✅ Bihar FM Signaling running on port", process.env.PORT || 3000);
+});
