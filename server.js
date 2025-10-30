@@ -1,197 +1,105 @@
-// server.js — BiharFM signaling + auto binary-tree mini-host assignment
-// Node.js: npm i express ws
-const express = require("express");
-const http = require("http");
-const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
+// server.js — FM Room Signaling with auto 2-listener groups
+import express from "express";
+import { WebSocketServer } from "ws";
+import http from "http";
+import crypto from "crypto";
 
 const app = express();
-app.get("/", (_, res) => res.send("🎧 BiharFM tree signaling"));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// clients: id -> { ws, role, customId, parentId, children: Set }
-const clients = new Map();
+app.get("/", (req, res) => res.send("🎧 Bihar FM Room Server is running"));
 
-// queue of clientIds that can accept children (maxChildren = 2)
-const availableParents = []; // FIFO queue
+// --- Data Structures ---
+let broadcaster = null;
+let listeners = new Map(); // id -> ws
+let rooms = []; // [{ id: "fm1234", members: [listenerIds] }]
 
-function mkClientEntry(ws) {
-  return { ws, role: null, customId: null, parentId: null, children: new Set() };
+// --- Utility ---
+function createRoomId() {
+  return "fm" + Math.floor(1000 + Math.random() * 90000);
 }
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== ws.OPEN) return;
-  try { ws.send(JSON.stringify(obj)); } catch (e) {}
+function getOrCreateRoom() {
+  let room = rooms.find(r => r.members.length < 2);
+  if (!room) {
+    room = { id: createRoomId(), members: [] };
+    rooms.push(room);
+  }
+  return room;
 }
-function enqueueParent(id) {
-  if (!id) return;
-  if (!availableParents.includes(id)) availableParents.push(id);
-}
-function dequeueParent() {
-  return availableParents.shift();
-}
-function hasCapacity(id) {
-  const c = clients.get(id);
-  if (!c) return false;
-  return c.children.size < 2;
-}
-function tryRequeue(id) {
-  if (!id) return;
-  if (hasCapacity(id)) enqueueParent(id);
-}
-function removeFromQueue(id) {
-  const i = availableParents.indexOf(id);
-  if (i >= 0) availableParents.splice(i, 1);
+function broadcastTo(ws, data) {
+  if (ws?.readyState === ws.OPEN) ws.send(JSON.stringify(data));
 }
 
+// --- WebSocket Connections ---
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  clients.set(id, mkClientEntry(ws));
-  clients.get(id).customId = id;
-  console.log("→ connected:", id);
+  ws.id = id;
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    const { type, role, customId, target, payload } = msg;
-    const entry = clients.get(id);
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
 
-    if (type === "register") {
-      entry.role = role || "listener";
-      if (customId) entry.customId = customId;
-
-      if (entry.role === "broadcaster") {
-        console.log("▶ broadcaster registered:", id);
-        // broadcaster becomes root parent
-        enqueueParent(id);
-        // inform broadcaster of current available parents (optional)
-        safeSend(ws, { type: "rooms-info", availableParentsCount: availableParents.length });
-        return;
+      // --- Register broadcaster ---
+      if (data.type === "register" && data.role === "broadcaster") {
+        broadcaster = ws;
+        broadcastTo(ws, { type: "registered", role: "broadcaster" });
+        console.log("🎙️ Broadcaster connected:", id);
       }
 
-      // listener registration -> assign a parent from availableParents
-      if (entry.role === "listener") {
-        // find parent with capacity
-        // prefer the earliest enqueued parent with capacity
-        let parentId = null;
-        while (availableParents.length) {
-          const cand = availableParents[0]; // peek
-          if (hasCapacity(cand)) { parentId = cand; break; }
-          // else remove exhausted candidate
-          dequeueParent();
-        }
-        if (!parentId) {
-          // if none available, fallback: choose broadcaster if any
-          parentId = Array.from(clients.entries()).find(([k,v])=>v.role==="broadcaster")?.[0] || null;
-          if (!parentId) {
-            // no broadcaster yet: assign to self (will enqueue)
-            parentId = id;
-          }
-        }
+      // --- Register listener ---
+      else if (data.type === "register" && data.role === "listener") {
+        listeners.set(id, ws);
+        const room = getOrCreateRoom();
+        room.members.push(id);
+        ws.roomId = room.id;
+        broadcastTo(ws, { type: "room-joined", roomId: room.id });
+        console.log(`👂 Listener joined room ${room.id} (${room.members.length}/2)`);
 
-        // assign parent-child linking
-        entry.parentId = parentId;
-        const parentEntry = clients.get(parentId);
-        if (parentEntry) {
-          parentEntry.children.add(id);
-        }
-
-        // enqueue the new listener as potential parent (it can accept children)
-        enqueueParent(id);
-
-        // if parent now full (2 children), remove it from queue
-        if (!hasCapacity(parentId)) removeFromQueue(parentId);
-
-        // notify parent to create offer to this child
-        if (parentEntry && parentEntry.ws && parentEntry.ws.readyState === parentEntry.ws.OPEN) {
-          safeSend(parentEntry.ws, { type: "child-joined", childId: id });
-        }
-
-        // notify the child of its parent assignment
-        safeSend(ws, { type: "parent-assigned", parentId });
-
-        console.log(`listener ${entry.customId} assigned parent ${parentId}`);
-        return;
+        // Notify broadcaster about new listener
+        if (broadcaster)
+          broadcastTo(broadcaster, { type: "listener-joined", id });
       }
-    }
 
-    // signaling passthrough (offer/answer/candidate) to specific target
-    if (["offer","answer","candidate"].includes(type) && target) {
-      const t = clients.get(target);
-      if (t) safeSend(t.ws, { type, from: id, payload });
-      return;
-    }
-
-    // metadata from broadcaster -> forward to all listeners (for UI)
-    if (type === "metadata" && clients.get(id)?.role === "broadcaster") {
-      for (const [cid, c] of clients.entries()) {
-        if (c.role === "listener") safeSend(c.ws, { type: "metadata", ...payload });
+      // --- Relay signaling ---
+      else if (data.type === "offer" && data.target) {
+        const target = listeners.get(data.target);
+        if (target) broadcastTo(target, { type: "offer", from: id, payload: data.payload });
+      } else if (data.type === "answer" && broadcaster) {
+        broadcastTo(broadcaster, { type: "answer", from: id, payload: data.payload });
+      } else if (data.type === "candidate") {
+        if (data.target && broadcaster && data.role === "broadcaster") {
+          const target = listeners.get(data.target);
+          if (target) broadcastTo(target, { type: "candidate", from: id, payload: data.payload });
+        } else if (broadcaster && data.role === "listener") {
+          broadcastTo(broadcaster, { type: "candidate", from: id, payload: data.payload });
+        }
       }
-      return;
-    }
 
-    // room-message / misc forwarding within subtree (optional)
-    if (type === "room-message") {
-      // forward to children only (optional)
-      const c = clients.get(id);
-      if (!c) return;
-      for (const childId of c.children) {
-        const ch = clients.get(childId);
-        if (ch) safeSend(ch.ws, { type: "room-message", from: id, payload });
+      // --- Metadata broadcast ---
+      else if (data.type === "metadata") {
+        // Send metadata to all listeners
+        for (const l of listeners.values())
+          broadcastTo(l, { type: "metadata", payload: data.payload });
       }
-      return;
+    } catch (e) {
+      console.warn("WS parse error:", e);
     }
   });
 
   ws.on("close", () => {
-    console.log("← disconnected:", id);
-    const entry = clients.get(id);
-    if (!entry) return;
-
-    // remove from parent's children set
-    const parentId = entry.parentId;
-    if (parentId && clients.has(parentId)) {
-      clients.get(parentId).children.delete(id);
-      // parent may regain capacity -> requeue it
-      tryRequeue(parentId);
-      // notify parent that child left
-      safeSend(clients.get(parentId).ws, { type: "child-left", childId: id });
+    if (broadcaster === ws) {
+      broadcaster = null;
+      console.log("❌ Broadcaster disconnected");
+    } else {
+      listeners.delete(id);
+      rooms.forEach(r => (r.members = r.members.filter(m => m !== id)));
+      rooms = rooms.filter(r => r.members.length > 0);
+      if (broadcaster)
+        broadcastTo(broadcaster, { type: "peer-left", id });
     }
-
-    // for each child of this node, we should reassign them to other parents
-    // naive approach: reassign each child by treating them as new join (enqueue them and pick new parent)
-    // but to keep simple, notify children to reconnect (client will re-register)
-    for (const childId of entry.children) {
-      const ch = clients.get(childId);
-      if (ch) {
-        safeSend(ch.ws, { type: "parent-lost" });
-      }
-    }
-
-    // remove from availableParents if present
-    removeFromQueue(id);
-
-    clients.delete(id);
-  });
-
-  ws.on("error", () => {
-    // similar cleanup as close
-    const entry = clients.get(id);
-    if (!entry) return;
-    const parentId = entry.parentId;
-    if (parentId && clients.has(parentId)) {
-      clients.get(parentId).children.delete(id);
-      tryRequeue(parentId);
-      safeSend(clients.get(parentId).ws, { type: "child-left", childId: id });
-    }
-    for (const childId of entry.children) {
-      const ch = clients.get(childId);
-      if (ch) safeSend(ch.ws, { type: "parent-lost" });
-    }
-    removeFromQueue(id);
-    clients.delete(id);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Signaling server listening on ${PORT}`));
+server.listen(PORT, () => console.log("✅ Server running on port", PORT));
